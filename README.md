@@ -1,13 +1,23 @@
-CUDA Stream Compaction
+CUDA Stream Compaction Playground
 ======================
+Originally a CIS 5650 project on testing different stream compaction and scan algorithms, I've repurposed this as my CUDA kernel practice playground. Some things I've implemented on 2^24 element tests:
+- Naive "Kogge-Stone" scan (13.39ms)
+- Work-efficient upsweep/downsweep scan (11.32ms)
+- **Shared-memory + warp-intrinsic scan, currently at 801.98us**
+    - Target is to match CUDA's thrust, which runs at ~678.94us.
+    - Internally, I refer to this as "Efficient-Shared Scan".
 
-* Anthony Ge
+![](img/recentResultsOct7.png)
+
+![](img/timerResults.png)
+
+I've added a new folder named **computeCaptures**, which contains some csv timings that I'm currently using for performance analysis/comparison.
+
+---
+Personal Info:
   * [LinkedIn](https://www.linkedin.com/in/anthonyge/), [personal website](https://www.geant.pro)
-* Tested on: Windows 11, i9-13900H @ 2600 Mhz 16GB, NVIDIA 
+  * Tested on: Windows 11, i9-13900H @ 2600 Mhz 16GB, NVIDIA 
 GeForce RTX 4070 Laptop GPU 8GB (personal)
-
-![](img/teaser.png)
-*Added Efficient Warp Shared Scan, seems to be pretty close to thrust.*
 
 ## Parallel Algorithms Introduction
 This project was initially a homework project for CIS 5650, GPU Programming at the University of Pennsylvania. I've since then reworked the base-code a bit and tested a new scan-implementation. **Profiling for warp-shared scan to come soon!**
@@ -17,11 +27,10 @@ For this assignment, I implemented several parallel algorithms in CUDA, comparin
 - CPU Stream Compaction
 - GPU Naive Scan
 - GPU Work-Efficient Scan
-- GPU Stream Compaction with Sscan
+- GPU Stream Compaction with Scan
 
 Under EC:
 - GPU Optimized Work-Efficient Scan (EC)
-- GPU Shared Memory Scan for Array Size < 2^14 (partial EC?)
 
 We are particularly covering prefix-sum scans, where given an input array ```n``` and a binary associate operator, in our case a sum, and identity (0), we can output an array s.t each element is the result of the applying the operator on the previous element and the input element.
 
@@ -93,7 +102,9 @@ While this means we have ```O(2log(n))``` dispatches, asymptotically our work-ef
 In implementation, it is often the case that work-efficient performs worse than naive because, in turn by having less adds, we therefore have less threads doing work and therefore many inactive warps that don't need to be launched in the first place. We can dynamically optimize the blocks and block size to only launch the necessary needed number of threads. More of this is covered further in the analysis.
 
 ---
-#### Shared Memory Optimized Work-Efficient GPU Scan (not working)
+#### Efficient Shared Scan (WIP)
+#### Note: I didn't get to do this for the homework originally, so this is a new feature I started in September of 2026.
+
 Another limitation of all GPU implementations so far is the cost incurred from global memory reads and thus long scoreboard stalls.  We can avoid this issue by loading information into shared memory per SM and use a different approach that operates our scans on blocks, then merging results together.
 
 Depending on a block size, we can parallelize by having blocks work on chunks of our input array ```n```. Per block, we can populate the array into its shared memory and then perform an inclusive sweep, while also writing overall sums into an array of block sums. We can perform an additional scan on the block sum array before (thinking of this as all sums of element before the given block), then adding the scanned block sum results back into the respective blocks, giving us an optimized scan.
@@ -107,6 +118,70 @@ Depending on a block size, we can parallelize by having blocks work on chunks of
 
 *Images taken from CIS 5650 slides*
 
+While we can perform a scan on the entire block by storing all input data in shared-memory, we can instead use **warp intrinsics** to our advantage and instead perform even SMALLER scans on chunks of 32 elements, saving these warp sums to shared-memory instead and processing offset sums like above for a super optimized block scan.
+
+```
+for ( logOffset = 0; logOffset <= 4; logOffset++ )
+{
+    unsigned int delta = 1 << logOffset;
+    unsigned int readValue = __shfl_up_sync(mask, laneValue, delta, WARP_SIZE);
+
+    if (laneId >= delta)
+    {
+        laneValue += readValue;
+    }
+}
+```
+
+What's nice about warp-shuffling operations is that it enables us to read the registers of other threads within the same warp in lock-step - this allows us to use the shuffle_up_sync operation to effectively sum a single element owned by a thread by reading register values from other threads. Once we're done, we simply write this out to shared memory and sync once done.
+
+More to come in this write-up soon, but we can ultimately use the algorithm above once we gather our block-scans and recursively perform a scan on top of that. A final kernel is needed to write block-increments to all values, in total resulting 2 * (N global memory reads + N global memory writes). This is because our block-scan kernel requires 2N read/writes, and our increment dispatch takes 2N read/writes.
+
+I found that this can be reduced to 3N instead if we perform the block-sum reductions first in a separate kernel without an initial scan, similarly using wave intrinsics. 
+
+```
+__global__ void blockReduce( const int n, int* dev_idata, int* blockSums)
+{
+    __shared__ int warpSums[WARP_SCAN_SIZE];
+    int threadId = threadIdx.x;
+    int globalThreadId = threadId + blockIdx.x * BLOCK_SIZE;
+    int value = ( globalThreadId < n ) ? dev_idata[globalThreadId] : 0;
+
+    for ( int offset = WARP_SIZE / 2; offset > 0; offset >>= 1 )
+    {
+        value += __shfl_down_sync(FULL_MASK, value, offset);
+    }
+
+    if ( threadId % WARP_SIZE == 0 ) 
+    {
+        warpSums[threadId / WARP_SIZE] = value;
+    }
+
+    __syncthreads();
+    
+    // sum warp sums together
+    if ( threadId < WARP_SIZE )
+    {
+        int finalSum = ( threadId < WARP_SCAN_SIZE ) ? warpSums[threadId] : 0;
+        for ( int offset = WARP_SIZE / 2; offset > 0; offset >>= 1 )
+        {
+            finalSum += __shfl_down_sync(FULL_MASK, finalSum, offset);
+        }
+        if ( threadId == 0 )
+        {
+            blockSums[blockIdx.x] = finalSum;
+        }
+    }
+}
+```
+
+We can then trivially gather block-increments from there and then perform our block-scan, merging block-increments add into that kernel. This reduces a kernel dispatch, helping our performance and improving memory throughput.
+
+This gives us our final timings as seen in this NSight Compute capture:
+
+![](img/efficientSharedResults.png)
+
+This is about **~801.98us**, within 18% of thrust's results in the three kernels above. Referencing the Oct 7 LDG move CSV in computeCaptures, our scan algorithm performs **16.6x faster than Naive, and 14.1x faster than our optimized efficient.** It's pretty bananas how much we can push scan just by taking advantage of warps and shared-memory.
 
 ## Performance Analysis
 **For my performance analysis, I logged the measured time 50 times per algorithm and averaged the result to get my "average runtime" stat in ms.**
@@ -237,13 +312,13 @@ This screenshot is from the upsweep kernel, showing similar results.
 
 Problems like these can therefore be circumvented using shared memory, which is much faster to access than global memory. Ideally, we would be able to quickly populated shared mem, sync threads, then only use shared mem for our kernel computes. 
 
----
+<!-- ---
 
 Using an alternative method of performing scan using shared memory by performing sub-scans on blocks, running another scan on an array of block reductions and then re-adding respective block elemens to original values in blocks, I was able to reach remarkable speedups!
 
 ![](img/optimizedSharedMem.png)
 
-In this case, for N=2^12 (4096) **we went from 0.422ms to 0.244ms.** However I was only able to achieve this up until 2^14, before I started running into issues regarding max block size and SM memory limits. I unfortunately was not able to fix it and thus omitted this implementation in any of my performance readings, though I'm still optimistic that this can provide some nice perf wins.
+In this case, for N=2^12 (4096) **we went from 0.422ms to 0.244ms.** However I was only able to achieve this up until 2^14, before I started running into issues regarding max block size and SM memory limits. I unfortunately was not able to fix it and thus omitted this implementation in any of my performance readings, though I'm still optimistic that this can provide some nice perf wins. -->
 
 ---
 #### Thrust Analysis
@@ -273,7 +348,7 @@ The striped arrangement, then, essentially has the items owned by a thread have 
 I have no idea how thrust loads and uses warp-striped arrangement for its data, but at the end of the day, less kernels are used and there's a high chance of coalesced memory access and shared memory use that allow for better performance overall.
 
 ---
-### Test Program Output
+<!-- ### Test Program Output [OUDATED]
 
 Tested output for 2^20. **Ignore the ```SHARED MEMORY scan``` since it only works for values of < 2^14.**
 ```
@@ -393,4 +468,4 @@ For fun, here's the result for 2^12 with the shared memory working, scoring bett
 ==== work-efficient compact, non-power-of-two ====
    elapsed time: 0.592896ms    (CUDA Measured)
     passed
-```
+``` -->

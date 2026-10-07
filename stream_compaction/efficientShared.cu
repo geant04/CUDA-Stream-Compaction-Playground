@@ -100,11 +100,49 @@ namespace StreamCompaction {
             return laneValue;
         }
 
-        __device__ void blockUsingWarpSumInternalScan(const int n, const int passes, const bool isInclusive, int *dev_odata, int *dev_idata)
+		// writes out sum of elements in a block to blockSums array
+		__global__ void blockReduce( const int n, int* dev_idata, int* blockSums)
+		{
+			__shared__ int warpSums[WARP_SCAN_SIZE];
+			int threadId = threadIdx.x;
+			int globalThreadId = threadId + blockIdx.x * BLOCK_SIZE;
+			int value = ( globalThreadId < n ) ? dev_idata[globalThreadId] : 0;
+
+            for ( int offset = WARP_SIZE / 2; offset > 0; offset >>= 1 )
+            {
+                value += __shfl_down_sync(FULL_MASK, value, offset);
+            }
+
+			if ( threadId % WARP_SIZE == 0 ) 
+			{
+				warpSums[threadId / WARP_SIZE] = value;
+			}
+
+			__syncthreads();
+			
+			// sum warp sums together
+			if ( threadId < WARP_SIZE )
+			{
+				int finalSum = ( threadId < WARP_SCAN_SIZE ) ? warpSums[threadId] : 0;
+				for ( int offset = WARP_SIZE / 2; offset > 0; offset >>= 1 )
+				{
+					finalSum += __shfl_down_sync(FULL_MASK, finalSum, offset);
+				}
+				if ( threadId == 0 )
+				{
+					blockSums[blockIdx.x] = finalSum;
+				}
+			}
+		}
+
+        __device__ void blockUsingWarpSumInternalScan(const int n, const int passes, 
+			const bool isInclusive, int *dev_odata, int *dev_idata, int *dev_block_scanned_sums)
         {
             // Warp sum arrays
             __shared__ int warpSums[WARP_SCAN_SIZE];
 
+			// move offset LDG up here and see if it reduces SASS stall
+			const int offset = dev_block_scanned_sums ? dev_block_scanned_sums[blockIdx.x] : 0;
             int localThreadId = threadIdx.x;
             int laneId = localThreadId % WARP_SIZE;
             int warpId = localThreadId / WARP_SIZE;
@@ -153,7 +191,7 @@ namespace StreamCompaction {
 
             if (globalThreadId < n)
             {
-                dev_odata[globalThreadId] = warpScanOutput + difference;
+                dev_odata[globalThreadId] = warpScanOutput + difference + offset;
             }
         }
 
@@ -172,6 +210,7 @@ namespace StreamCompaction {
             }
         }
 
+		// Legacy scan code. Only here for reference of what I did before.
         __device__ void blockInternalScan(int n, int passes, int *dev_odata, int *dev_idata)
         {
             __shared__ int read[BLOCK_SIZE];
@@ -205,7 +244,8 @@ namespace StreamCompaction {
             dev_odata[localThreadId] = writeBuffer[localThreadId];
         }
 
-        __global__ void efficientSharedScan(int scanType, int n, int passes, const bool isInclusive, int *dev_odata, int *dev_idata)
+        __global__ void efficientSharedScan(int scanType, int n, int passes,
+			const bool isInclusive, int *dev_odata, int *dev_idata, int *dev_block_scanned_sums )
         {
             if (scanType == 0)
             {
@@ -217,7 +257,7 @@ namespace StreamCompaction {
 
             if (scanType == 1)
             {
-                blockUsingWarpSumInternalScan(n, passes, isInclusive, dev_odata, dev_idata);
+                blockUsingWarpSumInternalScan(n, passes, isInclusive, dev_odata, dev_idata, dev_block_scanned_sums );
                 return;
             }
         }
@@ -261,7 +301,21 @@ namespace StreamCompaction {
             }
         }
 
-        static void multi_pass_block_scan(int n, int *dev_odata, int *dev_idata, const bool isInclusive)
+		static int allocate_scan_upfront(int n)
+		{
+			int numInts = 0;
+			int blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+			while( blocks > 1 )
+			{
+				// allocate enough data for dev_block_sums and dev_block_scanned_sums
+				numInts += blocks * 2;
+				blocks = (blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
+			}
+
+			return numInts;
+		}
+
+        static void multi_pass_block_scan(int n, int *dev_odata, int *dev_idata, const bool isInclusive, int *dev_scratch_data)
         {
             const int passes = ilog2ceil(n);
             const int paddedArraySize = 1 << passes;
@@ -270,38 +324,25 @@ namespace StreamCompaction {
             if (blocks <= 1)
             {
                 // We'll just make everything inclusive by default. I guess. this is sort of rough.
-                efficientSharedScan<<<blocks, BLOCK_SIZE>>>(ScanType::WarpShared, n, passes, isInclusive, dev_odata, dev_idata);
+                efficientSharedScan<<<blocks, BLOCK_SIZE>>>(ScanType::WarpShared, n, passes, isInclusive, dev_odata, dev_idata, nullptr );
                 return;
             }
-            else
-            {
-                // Scratch buffer allocation for temp block sums
-                const int blockSumsSizeInBytes = sizeof(int) * blocks;
-                const int blockSumArraySize = (blocks + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                
-                int *dev_block_sums;
-                int *dev_block_scanned_sums;
-                cudaMalloc((void**)&dev_block_sums, blockSumsSizeInBytes);
-                cudaMalloc((void**)&dev_block_scanned_sums, blockSumsSizeInBytes);
-                cudaMemset(dev_block_sums, 0, blockSumsSizeInBytes);
-                cudaMemset(dev_block_scanned_sums, 0, blockSumsSizeInBytes);
 
-                // Perform scan on the block-level, in addition to gathering sums from each block
-                efficientSharedScan<<<blocks, BLOCK_SIZE>>>(ScanType::WarpShared, n, passes, isInclusive, dev_odata, dev_idata);
+            int *dev_block_sums = dev_scratch_data;
+            int *dev_block_scanned_sums = dev_scratch_data + blocks;
+			int *dev_next_scratch = dev_scratch_data + 2 * blocks;
 
-                // Gather block sums
-                writeBlockSumsToArray<<<blockSumArraySize, BLOCK_SIZE>>>(n, blocks, isInclusive, dev_odata, dev_block_sums, dev_idata );
+            // Gather block sums
+			blockReduce<<<blocks, BLOCK_SIZE>>>(n, dev_idata, dev_block_sums);
 
-                // Recursively perform exclusive scan on the sum, use false param
-                multi_pass_block_scan(blocks, dev_block_scanned_sums, dev_block_sums, false);
+            // Recursively perform exclusive scan on the sum, use false param
+            multi_pass_block_scan(blocks, dev_block_scanned_sums, dev_block_sums, false, dev_next_scratch);
 
-                // Propogate results back to the blocks from the dev_block_scanned_sums... results should be made exclusive but
-                // to replicate slide results, we'll just make them inclusive
-                addScannedSumsToBlocks<<<blocks, BLOCK_SIZE>>>(n, dev_block_scanned_sums, dev_odata);
-
-                cudaFree(dev_block_sums);
-                cudaFree(dev_block_scanned_sums);
-            }
+            // Propogate results back to the blocks from the dev_block_scanned_sums... results should be made exclusive but
+            // to replicate slide results, we'll just make them inclusive
+			// Perform scan on the block-level, in addition to gathering sums from each block
+            efficientSharedScan<<<blocks, BLOCK_SIZE>>>(ScanType::WarpShared, n, passes, isInclusive, 
+				dev_odata, dev_idata, dev_block_scanned_sums);
         }
 
         void scan_internal(const int scanType, int n, int *odata, const int *idata) {
@@ -311,11 +352,15 @@ namespace StreamCompaction {
             const int passes = ilog2ceil(arraySize);
             const int paddedArraySize = 1 << passes;
             const int sizeInBytes = sizeof(int) * paddedArraySize;
+			
+			int *dev_scratch_data;
+			const int scratchDataSizeInBytes = sizeof(int) * allocate_scan_upfront(n);
 
             // Memory allocation
             {
                 cudaMalloc((void**)&dev_idata, sizeInBytes);
                 cudaMalloc((void**)&dev_odata, sizeInBytes);
+				cudaMalloc((void**)&dev_scratch_data, scratchDataSizeInBytes);
                 cudaMemcpy(dev_idata, idata, sizeInBytes, cudaMemcpyHostToDevice);
                 timer().startGpuTimer();
             }
@@ -323,7 +368,7 @@ namespace StreamCompaction {
             // Stream compaction algorithm/dispatches
             // 1D grid of blocks for stream compaction
             {   
-                 multi_pass_block_scan(arraySize, dev_odata, dev_idata, false);
+                multi_pass_block_scan(arraySize, dev_odata, dev_idata, false, dev_scratch_data);
             }
 
             // Send results back to host + cleanup
@@ -332,6 +377,7 @@ namespace StreamCompaction {
                 cudaMemcpy(odata, dev_odata, sizeInBytes, cudaMemcpyDeviceToHost);
                 cudaFree(dev_idata);
                 cudaFree(dev_odata);
+				cudaFree(dev_scratch_data);
             }
         }
 
